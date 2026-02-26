@@ -166,6 +166,8 @@ class SamplingRequest:
     ref_wav: str | None = None
     ref_latent: str | None = None
     no_ref: bool = False
+    num_candidates: int = 1
+    decode_mode: str = "sequential"
     seconds: float = 30.0
     max_ref_seconds: float | None = 30.0
     max_text_len: int | None = None
@@ -193,6 +195,7 @@ class SamplingRequest:
 @dataclass
 class SamplingResult:
     audio: torch.Tensor
+    audios: list[torch.Tensor]
     sample_rate: int
     stage_timings: list[tuple[str, float]]
     total_to_decode: float
@@ -460,17 +463,22 @@ class InferenceRuntime:
         self,
         *,
         req: SamplingRequest,
+        batch_size: int,
         messages: list[str],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         runtime_dtype = next(self.model.parameters()).dtype
         if req.no_ref:
             ref_len = max(1, int(self.model_cfg.speaker_patch_size))
             ref_latent_patched = torch.zeros(
-                (1, ref_len, self.model_cfg.latent_dim * self.model_cfg.latent_patch_size),
+                (
+                    batch_size,
+                    ref_len,
+                    self.model_cfg.latent_dim * self.model_cfg.latent_patch_size,
+                ),
                 device=self.model_device,
                 dtype=runtime_dtype,
             )
-            ref_mask = torch.zeros((1, ref_len), dtype=torch.bool, device=self.model_device)
+            ref_mask = torch.zeros((batch_size, ref_len), dtype=torch.bool, device=self.model_device)
             return ref_latent_patched, ref_mask
 
         if req.ref_wav is None and req.ref_latent is None:
@@ -519,8 +527,10 @@ class InferenceRuntime:
             raise ValueError(
                 "Reference latent length became zero after patchify. Use longer reference audio."
             )
+        if batch_size > 1:
+            ref_latent_patched = ref_latent_patched.repeat(batch_size, 1, 1)
         ref_mask = torch.ones(
-            (1, ref_latent_patched.shape[1]), dtype=torch.bool, device=self.model_device
+            (batch_size, ref_latent_patched.shape[1]), dtype=torch.bool, device=self.model_device
         )
         return ref_latent_patched, ref_mask
 
@@ -539,7 +549,7 @@ class InferenceRuntime:
             (
                 "[runtime] start synthesize "
                 "model_device={} model_precision={} codec_device={} codec_precision={} "
-                "watermark={} mode={} seconds={} steps={} seed={}"
+                "watermark={} mode={} seconds={} steps={} seed={} candidates={} decode_mode={}"
             ).format(
                 self.key.model_device,
                 self.key.model_precision,
@@ -550,11 +560,21 @@ class InferenceRuntime:
                 req.seconds,
                 req.num_steps,
                 "random" if req.seed is None else int(req.seed),
+                req.num_candidates,
+                req.decode_mode,
             )
         )
 
         if req.seconds <= 0:
             raise ValueError(f"seconds must be > 0, got {req.seconds}")
+        num_candidates = int(req.num_candidates)
+        if num_candidates <= 0:
+            raise ValueError(f"num_candidates must be > 0, got {num_candidates}")
+        decode_mode = str(req.decode_mode).strip().lower()
+        if decode_mode not in {"sequential", "batch"}:
+            raise ValueError(
+                f"Unsupported decode_mode={req.decode_mode!r}. Expected one of: sequential, batch."
+            )
 
         raw_text = str(req.text)
         normalized_text = normalize_text(raw_text).strip()
@@ -626,7 +646,8 @@ class InferenceRuntime:
         with self._infer_lock, torch.inference_mode():
             t0 = _measure_start(self.model_device)
             text_ids, text_mask = self.tokenizer.batch_encode(
-                [normalized_text], max_length=text_max_len
+                [normalized_text] * num_candidates,
+                max_length=text_max_len,
             )
             stage_sec = _measure_end(self.model_device, t0)
             stage_timings.append(("tokenize_text", stage_sec))
@@ -650,7 +671,11 @@ class InferenceRuntime:
 
             t0 = _measure_start(self.model_device, self.codec_device)
             msg_count_before_ref = len(messages)
-            ref_latent, ref_mask = self._load_reference_latent(req=req, messages=messages)
+            ref_latent, ref_mask = self._load_reference_latent(
+                req=req,
+                batch_size=num_candidates,
+                messages=messages,
+            )
             stage_sec = _measure_end(self.model_device, t0, self.codec_device)
             stage_timings.append(("prepare_reference", stage_sec))
             for msg in messages[msg_count_before_ref:]:
@@ -696,30 +721,49 @@ class InferenceRuntime:
             z = z[:, :latent_steps]
 
             t0 = _measure_start(self.model_device, self.codec_device)
-            audio = self.codec.decode_latent(z).cpu()
+            trimmed_audios: list[torch.Tensor] = []
+            if decode_mode == "batch":
+                audio_batch = self.codec.decode_latent(z).cpu()
+                for i in range(num_candidates):
+                    audio_i = audio_batch[i]
+                    max_samples = target_samples
+                    if bool(req.trim_tail):
+                        flattening_point = find_flattening_point(
+                            z[i],
+                            window_size=max(1, int(req.tail_window_size)),
+                            std_threshold=float(req.tail_std_threshold),
+                            mean_threshold=float(req.tail_mean_threshold),
+                        )
+                        flattening_samples = int(flattening_point * int(self.codec.model.hop_length))
+                        if flattening_samples > 0:
+                            max_samples = min(max_samples, flattening_samples)
+                    trimmed_audios.append(audio_i[:, :max_samples])
+            else:
+                for i in range(num_candidates):
+                    audio_i = self.codec.decode_latent(z[i : i + 1]).cpu()[0]
+                    max_samples = target_samples
+                    if bool(req.trim_tail):
+                        flattening_point = find_flattening_point(
+                            z[i],
+                            window_size=max(1, int(req.tail_window_size)),
+                            std_threshold=float(req.tail_std_threshold),
+                            mean_threshold=float(req.tail_mean_threshold),
+                        )
+                        flattening_samples = int(flattening_point * int(self.codec.model.hop_length))
+                        if flattening_samples > 0:
+                            max_samples = min(max_samples, flattening_samples)
+                    trimmed_audios.append(audio_i[:, :max_samples])
             stage_sec = _measure_end(self.model_device, t0, self.codec_device)
             stage_timings.append(("decode_latent", stage_sec))
-            _log(f"[runtime] decode_latent: {stage_sec * 1000.0:.1f} ms")
+            _log(f"[runtime] decode_latent ({decode_mode}): {stage_sec * 1000.0:.1f} ms")
 
             total_to_decode = _measure_end(self.model_device, post_load_t0, self.codec_device)
             _log(f"[runtime] total_to_decode: {total_to_decode:.3f} s")
 
-            max_samples = target_samples
-            if bool(req.trim_tail):
-                flattening_point = find_flattening_point(
-                    z[0],
-                    window_size=max(1, int(req.tail_window_size)),
-                    std_threshold=float(req.tail_std_threshold),
-                    mean_threshold=float(req.tail_mean_threshold),
-                )
-                flattening_samples = int(flattening_point * int(self.codec.model.hop_length))
-                if flattening_samples > 0:
-                    max_samples = min(max_samples, flattening_samples)
-            audio = audio[..., :max_samples]
-
         _log("[runtime] done synthesize")
         return SamplingResult(
-            audio=audio[0],
+            audio=trimmed_audios[0],
+            audios=trimmed_audios,
             sample_rate=int(self.codec.sample_rate),
             stage_timings=stage_timings,
             total_to_decode=total_to_decode,

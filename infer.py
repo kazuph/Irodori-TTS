@@ -112,6 +112,22 @@ def main() -> None:
     )
     parser.add_argument("--num-steps", type=int, default=40)
     parser.add_argument(
+        "--num-candidates",
+        type=int,
+        default=1,
+        help="Number of candidates to generate in a single batched sampling pass.",
+    )
+    parser.add_argument(
+        "--decode-mode",
+        choices=["sequential", "batch"],
+        default="sequential",
+        help=(
+            "Codec decode mode. "
+            "'sequential': decode each candidate one-by-one (lower VRAM), "
+            "'batch': decode all candidates at once (faster, higher VRAM)."
+        ),
+    )
+    parser.add_argument(
         "--compile-model",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -273,6 +289,8 @@ def main() -> None:
             ref_wav=args.ref_wav,
             ref_latent=args.ref_latent,
             no_ref=bool(args.no_ref),
+            num_candidates=int(args.num_candidates),
+            decode_mode=str(args.decode_mode),
             seconds=FIXED_SECONDS,
             max_ref_seconds=float(args.max_ref_seconds)
             if args.max_ref_seconds is not None
@@ -309,9 +327,17 @@ def main() -> None:
         log_fn=None,
     )
 
-    out_path = save_wav(args.output_wav, result.audio, result.sample_rate)
     print(f"[seed] used_seed: {result.used_seed}")
-    print(f"Saved: {out_path}")
+    if int(args.num_candidates) == 1:
+        out_path = save_wav(args.output_wav, result.audio, result.sample_rate)
+        print(f"Saved: {out_path}")
+    else:
+        base_path = Path(str(args.output_wav))
+        suffix = base_path.suffix if base_path.suffix else ".wav"
+        for i, audio in enumerate(result.audios, start=1):
+            out_path = base_path.with_name(f"{base_path.stem}_{i:03d}{suffix}")
+            saved = save_wav(out_path, audio, result.sample_rate)
+            print(f"Saved[{i}]: {saved}")
     if args.show_timings:
         _print_timings(result.stage_timings, result.total_to_decode)
 

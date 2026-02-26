@@ -20,6 +20,8 @@ from irodori_tts.inference_runtime import (
 )
 
 FIXED_SECONDS = 30.0
+MAX_GRADIO_CANDIDATES = 32
+GRADIO_AUDIO_COLS_PER_ROW = 8
 
 
 def _default_checkpoint() -> str:
@@ -172,6 +174,7 @@ def _run_generation(
     text: str,
     uploaded_audio: str | None,
     num_steps: int,
+    num_candidates: int,
     seed_raw: str,
     cfg_guidance_mode: str,
     cfg_scale_text: float,
@@ -186,7 +189,7 @@ def _run_generation(
     speaker_kv_scale_raw: str,
     speaker_kv_min_t_raw: str,
     speaker_kv_max_layers_raw: str,
-) -> tuple[str | None, str, str]:
+) -> tuple[object, ...]:
     def stdout_log(msg: str) -> None:
         print(msg, flush=True)
 
@@ -201,6 +204,11 @@ def _run_generation(
 
     if str(text).strip() == "":
         raise ValueError("text is required.")
+    requested_candidates = int(num_candidates)
+    if requested_candidates <= 0:
+        raise ValueError("num_candidates must be >= 1.")
+    if requested_candidates > MAX_GRADIO_CANDIDATES:
+        raise ValueError(f"num_candidates must be <= {MAX_GRADIO_CANDIDATES}.")
 
     cfg_scale = _parse_optional_float(cfg_scale_raw, "cfg_scale")
     truncation_factor = _parse_optional_float(truncation_factor_raw, "truncation_factor")
@@ -219,7 +227,7 @@ def _run_generation(
     stdout_log(
         (
             "[gradio] request: model_device={} model_precision={} codec_device={} codec_precision={} "
-            "watermark={} mode={} seconds={} steps={} seed={} no_ref={}"
+            "watermark={} mode={} seconds={} steps={} seed={} no_ref={} candidates={}"
         ).format(
             model_device,
             model_precision,
@@ -231,6 +239,7 @@ def _run_generation(
             num_steps,
             "random" if seed is None else seed,
             no_ref,
+            requested_candidates,
         )
     )
 
@@ -240,6 +249,8 @@ def _run_generation(
             ref_wav=ref_wav,
             ref_latent=None,
             no_ref=bool(no_ref),
+            num_candidates=requested_candidates,
+            decode_mode="sequential",
             seconds=FIXED_SECONDS,
             max_ref_seconds=30.0,
             max_text_len=None,
@@ -266,20 +277,34 @@ def _run_generation(
     out_dir = Path("gradio_outputs")
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    out_path = save_wav(out_dir / f"sample_{stamp}.wav", result.audio.float(), result.sample_rate)
+    out_paths: list[str] = []
+    for i, audio in enumerate(result.audios, start=1):
+        out_path = save_wav(
+            out_dir / f"sample_{stamp}_{i:03d}.wav",
+            audio.float(),
+            result.sample_rate,
+        )
+        out_paths.append(str(out_path))
 
     runtime_msg = "runtime: reloaded" if reloaded else "runtime: reused"
     detail_lines = [
         runtime_msg,
         f"seed_used: {result.used_seed}",
-        f"saved: {out_path}",
+        f"candidates: {len(result.audios)}",
+        *[f"saved[{i}]: {path}" for i, path in enumerate(out_paths, start=1)],
         *result.messages,
     ]
     detail_text = "\n".join(detail_lines)
     timing_text = _format_timings(result.stage_timings, result.total_to_decode)
-    stdout_log(f"[gradio] saved: {out_path}")
+    stdout_log(f"[gradio] saved {len(out_paths)} candidates")
 
-    return str(out_path), detail_text, timing_text
+    audio_updates: list[object] = []
+    for i in range(MAX_GRADIO_CANDIDATES):
+        if i < len(out_paths):
+            audio_updates.append(gr.update(value=out_paths[i], visible=True))
+        else:
+            audio_updates.append(gr.update(value=None, visible=False))
+    return tuple([*audio_updates, detail_text, timing_text])
 
 
 def _clear_runtime_cache() -> str:
@@ -347,6 +372,13 @@ def build_ui() -> gr.Blocks:
         with gr.Accordion("Sampling", open=True):
             with gr.Row():
                 num_steps = gr.Slider(label="Num Steps", minimum=1, maximum=120, value=40, step=1)
+                num_candidates = gr.Slider(
+                    label="Num Candidates",
+                    minimum=1,
+                    maximum=MAX_GRADIO_CANDIDATES,
+                    value=1,
+                    step=1,
+                )
                 seed_raw = gr.Textbox(label="Seed (blank=random)", value="")
 
             with gr.Row():
@@ -389,7 +421,24 @@ def build_ui() -> gr.Blocks:
 
         generate_btn = gr.Button("Generate", variant="primary")
 
-        out_audio = gr.Audio(label="Generated Audio", type="filepath")
+        out_audios: list[gr.Audio] = []
+        num_rows = (MAX_GRADIO_CANDIDATES + GRADIO_AUDIO_COLS_PER_ROW - 1) // GRADIO_AUDIO_COLS_PER_ROW
+        with gr.Column():
+            for row_idx in range(num_rows):
+                with gr.Row():
+                    for col_idx in range(GRADIO_AUDIO_COLS_PER_ROW):
+                        i = row_idx * GRADIO_AUDIO_COLS_PER_ROW + col_idx
+                        if i >= MAX_GRADIO_CANDIDATES:
+                            break
+                        out_audios.append(
+                            gr.Audio(
+                                label=f"Generated Audio {i + 1}",
+                                type="filepath",
+                                interactive=False,
+                                visible=(i == 0),
+                                min_width=160,
+                            )
+                        )
         out_log = gr.Textbox(label="Run Log", lines=8)
         out_timing = gr.Textbox(label="Timing", lines=8)
 
@@ -405,6 +454,7 @@ def build_ui() -> gr.Blocks:
                 text,
                 uploaded_audio,
                 num_steps,
+                num_candidates,
                 seed_raw,
                 cfg_guidance_mode,
                 cfg_scale_text,
@@ -420,7 +470,7 @@ def build_ui() -> gr.Blocks:
                 speaker_kv_min_t_raw,
                 speaker_kv_max_layers_raw,
             ],
-            outputs=[out_audio, out_log, out_timing],
+            outputs=[*out_audios, out_log, out_timing],
         )
         model_device.change(
             _on_model_device_change, inputs=[model_device], outputs=[model_precision]
