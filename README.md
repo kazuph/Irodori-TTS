@@ -54,6 +54,63 @@ uv sync
 
 On this fork, inference also supports `fp16` on `mps`. `bf16` remains CUDA-only.
 
+## Why this fork exists
+
+This fork exists to make **macOS MPS inference with `fp16`** usable for real local TTS workflows.
+
+Upstream currently rejects `fp16` in `resolve_runtime_dtype()` unless the device is CUDA, so
+`model_device=mps` + `model_precision=fp16` fails before inference starts. This fork adds:
+
+- `fp16` support on `mps` in `resolve_runtime_dtype()`
+- `fp16` exposure in `list_available_runtime_precisions()` for `mps`
+- README documentation for the new supported precision/device combination
+
+### Benchmark terminology
+
+To avoid ambiguity, the benchmark numbers below use these definitions:
+
+- **load**: time from calling `InferenceRuntime.from_key(...)` until the runtime is ready. This is the cold-start cost.
+- **synth**: time for one `runtime.synthesize(...)` call after the runtime is already loaded. This is the per-request generation latency.
+- **audio_sec**: generated waveform duration.
+- **rtf_total**: `audio_sec / synth`. Higher is faster.
+
+### Benchmark snapshot on Apple Silicon
+
+Measured locally on this fork with the `Aratako/Irodori-TTS-500M-v2-VoiceDesign` checkpoint.
+
+#### Shorter workload
+
+| Condition | load | synth | audio_sec | rtf_total |
+|---|---:|---:|---:|---:|
+| CPU fp32 | 10.825s | 3.664s | 4.0s | 1.092 |
+| MPS fp32 | 10.657s | 3.072s | 4.0s | 1.302 |
+| MPS fp16 | 8.174s | 3.395s | 4.0s | 1.178 |
+
+Interpretation:
+
+- `MPS fp32` was about **16% faster** than `CPU fp32` on per-request synthesis latency.
+- `MPS fp16` did **not** win on this shorter workload; it was slightly slower than `MPS fp32`.
+
+#### Heavier workload
+
+| Condition | load | synth | audio_sec | rtf_total |
+|---|---:|---:|---:|---:|
+| MPS fp32 | 8.397s | 5.517s | 8.0s | 1.450 |
+| MPS fp16 | 9.387s | 3.549s | 8.0s | 2.254 |
+
+Interpretation:
+
+- On the heavier workload, `MPS fp16` reduced per-request synthesis latency by about **35.7%** versus `MPS fp32`.
+- The cold-start cost (`load`) was not better in every case, but the steady-state path (`synth`) improved substantially.
+
+### Practical takeaway
+
+This fork should be understood as a **macOS/MPS inference fork**, not a general-purpose rewrite:
+
+- If your workload is short and latency is already low, `MPS fp32` may be competitive enough.
+- If your workload is longer or heavier, `MPS fp16` can provide a meaningful speedup.
+- Most importantly, upstream currently cannot run `MPS fp16` at all, while this fork can.
+
 ## Quick Start
 
 ### Simple Inference
