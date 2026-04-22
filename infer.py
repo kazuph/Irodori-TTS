@@ -12,6 +12,7 @@ from irodori_tts.inference_runtime import (
     RuntimeKey,
     SamplingRequest,
     default_runtime_device,
+    default_runtime_precision,
     resolve_cfg_scales,
     save_wav,
 )
@@ -94,9 +95,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--model-precision",
-        choices=["fp32", "bf16"],
-        default="fp32",
-        help="Model precision for weights/compute.",
+        choices=["fp32", "bf16", "fp16"],
+        default=None,
+        help="Model precision for weights/compute. Defaults to the best supported precision for the selected device.",
     )
     parser.add_argument(
         "--codec-device",
@@ -105,9 +106,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--codec-precision",
-        choices=["fp32", "bf16"],
-        default="fp32",
-        help="Codec precision for weights/compute.",
+        choices=["fp32", "bf16", "fp16"],
+        default=None,
+        help="Codec precision for weights/compute. Defaults to the best supported precision for the selected device.",
     )
     parser.add_argument(
         "--codec-deterministic-encode",
@@ -321,6 +322,10 @@ def main() -> None:
         help="Run without speaker reference conditioning. Use this for voice-design checkpoints.",
     )
     args = parser.parse_args()
+    if args.model_precision is None:
+        args.model_precision = default_runtime_precision(args.model_device)
+    if args.codec_precision is None:
+        args.codec_precision = default_runtime_precision(args.codec_device)
 
     checkpoint_path = _resolve_checkpoint_path(args)
 

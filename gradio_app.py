@@ -13,6 +13,7 @@ from irodori_tts.inference_runtime import (
     SamplingRequest,
     clear_cached_runtime,
     default_runtime_device,
+    default_runtime_precision,
     get_cached_runtime,
     list_available_runtime_devices,
     list_available_runtime_precisions,
@@ -48,14 +49,18 @@ def _precision_choices_for_device(device: str) -> list[str]:
     return list_available_runtime_precisions(device)
 
 
+def _default_precision_for_device(device: str) -> str:
+    return default_runtime_precision(device)
+
+
 def _on_model_device_change(device: str) -> gr.Dropdown:
     choices = _precision_choices_for_device(device)
-    return gr.Dropdown(choices=choices, value=choices[0])
+    return gr.Dropdown(choices=choices, value=_default_precision_for_device(device))
 
 
 def _on_codec_device_change(device: str) -> gr.Dropdown:
     choices = _precision_choices_for_device(device)
-    return gr.Dropdown(choices=choices, value=choices[0])
+    return gr.Dropdown(choices=choices, value=_default_precision_for_device(device))
 
 
 def _parse_optional_float(raw: str | None, label: str) -> float | None:
@@ -130,6 +135,7 @@ def _build_runtime_key(
         enable_watermark=bool(enable_watermark),
         compile_model=False,
         compile_dynamic=False,
+        transient_codec=True,
     )
 
 
@@ -323,6 +329,8 @@ def build_ui() -> gr.Blocks:
     device_choices = list_available_runtime_devices()
     model_precision_choices = _precision_choices_for_device(default_model_device)
     codec_precision_choices = _precision_choices_for_device(default_codec_device)
+    default_model_precision = _default_precision_for_device(default_model_device)
+    default_codec_precision = _default_precision_for_device(default_codec_device)
 
     with gr.Blocks(title="Irodori-TTS Gradio") as demo:
         gr.Markdown("# Irodori-TTS Inference (Cached Runtime)")
@@ -345,7 +353,7 @@ def build_ui() -> gr.Blocks:
             model_precision = gr.Dropdown(
                 label="Model Precision",
                 choices=model_precision_choices,
-                value=model_precision_choices[0],
+                value=default_model_precision,
                 scale=1,
             )
             codec_device = gr.Dropdown(
@@ -357,7 +365,7 @@ def build_ui() -> gr.Blocks:
             codec_precision = gr.Dropdown(
                 label="Codec Precision",
                 choices=codec_precision_choices,
-                value=codec_precision_choices[0],
+                value=default_codec_precision,
                 scale=1,
             )
             enable_watermark = gr.State(False)

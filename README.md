@@ -52,6 +52,8 @@ uv sync
 
 **Note**: For Linux/Windows with CUDA, PyTorch is automatically installed from the cu128 index. For macOS (MPS) or CPU-only usage, `uv sync` will install the default PyTorch build.
 
+On macOS, the CLI now auto-selects `fp16` for `mps` when precision is not specified, and the Gradio UIs default to `mps + fp16` while keeping the DACVAE codec transient between requests to reduce cached-memory pressure.
+
 On this fork, inference also supports `fp16` on `mps`. `bf16` remains CUDA-only.
 
 ## Why this fork exists
@@ -65,69 +67,38 @@ Upstream currently rejects `fp16` in `resolve_runtime_dtype()` unless the device
 - `fp16` exposure in `list_available_runtime_precisions()` for `mps`
 - README documentation for the new supported precision/device combination
 
-### Benchmark terminology
+### Current macOS behavior
 
-To avoid ambiguity, the benchmark numbers below use these definitions:
+The current fork defaults to the following behavior on Apple Silicon:
 
-- **load**: time from calling `InferenceRuntime.from_key(...)` until the runtime is ready. This is the cold-start cost.
-- **synth**: time for one `runtime.synthesize(...)` call after the runtime is already loaded. This is the per-request generation latency.
-- **audio_sec**: generated waveform duration.
-- **rtf_total**: `audio_sec / synth`. Higher is faster.
-- **maximum resident set size (RSS)**: the largest resident memory reported by `/usr/bin/time -l`.
-- **peak memory footprint**: the larger process memory footprint reported by `/usr/bin/time -l`. On Apple Silicon this is the more useful top-line number for comparing MPS runs.
+- **CLI**: if `--model-precision` / `--codec-precision` are omitted, `mps` now auto-selects `fp16`
+- **Gradio**: both UIs default to `mps + fp16`
+- **Cached runtime**: the text-to-latent model stays cached, but the DACVAE codec is loaded only for active requests and released afterward
 
-### Benchmark snapshot on Apple Silicon
+### Current Apple Silicon guidance
 
-Measured locally on this fork with the `Aratako/Irodori-TTS-500M-v2-VoiceDesign` checkpoint.
+For local macOS inference, the current recommended setup is:
 
-#### Shorter workload
+1. `model_device=mps`
+2. `model_precision=fp16`
+3. `codec_device=mps`
+4. `codec_precision=fp16`
+5. `decode_mode=sequential`
 
-| Condition | load | synth | audio_sec | rtf_total |
-|---|---:|---:|---:|---:|
-| CPU fp32 | 10.825s | 3.664s | 4.0s | 1.092 |
-| MPS fp32 | 10.657s | 3.072s | 4.0s | 1.302 |
-| MPS fp16 | 8.174s | 3.395s | 4.0s | 1.178 |
+### Current memory status on Apple Silicon
 
-Interpretation:
+Measured locally with the `Aratako/Irodori-TTS-500M-v2-VoiceDesign` checkpoint on an 8-second no-reference VoiceDesign request.
 
-- `MPS fp32` was about **16% faster** than `CPU fp32` on per-request synthesis latency.
-- `MPS fp16` did **not** win on this shorter workload; it was slightly slower than `MPS fp32`.
-
-#### Heavier workload
-
-| Condition | load | synth | audio_sec | rtf_total |
-|---|---:|---:|---:|---:|
-| MPS fp32 | 8.397s | 5.517s | 8.0s | 1.450 |
-| MPS fp16 | 9.387s | 3.549s | 8.0s | 2.254 |
-
-Interpretation:
-
-- On the heavier workload, `MPS fp16` reduced per-request synthesis latency by about **35.7%** versus `MPS fp32`.
-- The cold-start cost (`load`) was not better in every case, but the steady-state path (`synth`) improved substantially.
-
-### Practical takeaway
-
-This fork should be understood as a **macOS/MPS inference fork**, not a general-purpose rewrite:
-
-- If your workload is short and latency is already low, `MPS fp32` may be competitive enough.
-- If your workload is longer or heavier, `MPS fp16` can provide a meaningful speedup.
-- Most importantly, upstream currently cannot run `MPS fp16` at all, while this fork can.
-
-### Memory snapshot on Apple Silicon
-
-Measured with `/usr/bin/time -l` on the same heavier workload class. Memory on Apple Silicon is a little tricky because MPS uses unified memory, so this fork documents both `maximum resident set size` and `peak memory footprint`.
-
-| Condition | maximum RSS | peak memory footprint | Notes |
+| Scenario | `torch.mps.driver_allocated_memory()` after load | after request | Summary |
 |---|---:|---:|---|
-| CPU fp32 | 6.03 GB | 6.30 GB | CPU baseline |
-| MPS fp32 | 2.29 GB | 6.42 GB | MPS shifts memory behavior; RSS alone is misleading |
-| MPS fp16 | 2.29 GB | 5.79 GB | About **9.9% lower** peak footprint than MPS fp32 |
+| Legacy cached `fp32` path | 3.60 GB | 4.79 GB | Higher steady-state memory pressure |
+| Current cached `fp16` + transient codec path | 2.41 GB | 2.53 GB | Lower cached-memory pressure while keeping MPS inference |
 
-Interpretation:
+Practical takeaway:
 
-- For MPS runs, **RSS was almost unchanged** between `fp32` and `fp16`, so RSS alone does not capture the practical difference well.
-- **Peak memory footprint** did improve: `MPS fp16` used about **9.9% less** peak footprint than `MPS fp32` in this measurement.
-- Combined with the latency improvement on heavier workloads, this means the fork is justified by **both** speed and memory behavior, not just by compatibility.
+- **`fp16` on MPS is the correct default** for this fork.
+- **Keeping the codec transient matters more than moving it to CPU** for this workload.
+- **This improves cached-memory behavior materially**, but it is still a PyTorch/MPS implementation rather than a full MLX rewrite or quantized deployment.
 
 ## Quick Start
 
@@ -252,8 +223,8 @@ uv run python infer.py \
 | `--speaker-kv-max-layers` | None | Apply speaker K/V scaling only to first N diffusion layers |
 | `--model-device` | auto | Device for model (`cuda`, `mps`, `cpu`) |
 | `--codec-device` | auto | Device for DACVAE codec |
-| `--model-precision` | `fp32` | Model precision (`fp32`, `bf16`, `fp16`). `bf16` is CUDA-only; `fp16` works on CUDA and MPS. |
-| `--codec-precision` | `fp32` | Codec precision (`fp32`, `bf16`, `fp16`). `bf16` is CUDA-only; `fp16` works on CUDA and MPS. |
+| `--model-precision` | best supported for device | Model precision (`fp32`, `bf16`, `fp16`). `bf16` is CUDA-only; `fp16` works on CUDA and MPS. On macOS `mps`, the default is `fp16`. |
+| `--codec-precision` | best supported for device | Codec precision (`fp32`, `bf16`, `fp16`). `bf16` is CUDA-only; `fp16` works on CUDA and MPS. On macOS `mps`, the default is `fp16`. |
 | `--seed` | random | Random seed for reproducibility |
 | `--compile-model` | False | Enable `torch.compile` for faster inference |
 | `--compile-dynamic` | False | Use `dynamic=True` for `torch.compile` |

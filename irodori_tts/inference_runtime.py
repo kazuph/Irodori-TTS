@@ -71,6 +71,14 @@ def list_available_runtime_precisions(device: str | torch.device) -> list[str]:
     return ["fp32"]
 
 
+def default_runtime_precision(device: str | torch.device) -> str:
+    resolved = resolve_runtime_device(device)
+    precisions = list_available_runtime_precisions(resolved)
+    if resolved.type == "mps" and "fp16" in precisions:
+        return "fp16"
+    return precisions[0]
+
+
 def _sync_device(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -98,6 +106,15 @@ def _measure_start(device: torch.device, *extra_devices: torch.device) -> float:
 def _measure_end(device: torch.device, t0: float, *extra_devices: torch.device) -> float:
     _sync_devices(device, *extra_devices)
     return time.perf_counter() - t0
+
+
+def _empty_device_cache(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    elif device.type == "mps":
+        mps = getattr(torch, "mps", None)
+        if mps is not None and hasattr(mps, "empty_cache"):
+            mps.empty_cache()
 
 
 def _coerce_latent_shape(latent: torch.Tensor, latent_dim: int) -> torch.Tensor:
@@ -163,6 +180,7 @@ class RuntimeKey:
     enable_watermark: bool = False
     compile_model: bool = False
     compile_dynamic: bool = False
+    transient_codec: bool = False
 
 
 @dataclass
@@ -406,7 +424,8 @@ class InferenceRuntime:
         model: TextToLatentRFDiT,
         tokenizer: PretrainedTextTokenizer,
         caption_tokenizer: PretrainedTextTokenizer | None,
-        codec: DACVAECodec,
+        codec: DACVAECodec | None,
+        codec_dtype: torch.dtype,
         default_text_max_len: int,
         default_caption_max_len: int,
     ) -> None:
@@ -419,9 +438,11 @@ class InferenceRuntime:
         self.tokenizer = tokenizer
         self.caption_tokenizer = caption_tokenizer
         self.codec = codec
+        self.codec_dtype = codec_dtype
         self.default_text_max_len = default_text_max_len
         self.default_caption_max_len = default_caption_max_len
         self._infer_lock = threading.Lock()
+        self._codec_lock = threading.Lock()
 
     @classmethod
     def from_key(cls, key: RuntimeKey) -> InferenceRuntime:
@@ -486,19 +507,21 @@ class InferenceRuntime:
             else:
                 default_caption_max_len = default_text_max_len
 
-        codec = DACVAECodec.load(
-            repo_id=key.codec_repo,
-            device=str(codec_device),
-            dtype=codec_dtype,
-            deterministic_encode=bool(key.codec_deterministic_encode),
-            deterministic_decode=bool(key.codec_deterministic_decode),
-            enable_watermark=bool(key.enable_watermark),
-        )
-        if model_cfg.latent_dim != codec.latent_dim:
-            raise ValueError(
-                f"Latent dimension mismatch: checkpoint latent_dim={model_cfg.latent_dim} but codec latent_dim={codec.latent_dim}. "
-                "Use a compatible codec/checkpoint pair."
+        codec = None
+        if not key.transient_codec:
+            codec = DACVAECodec.load(
+                repo_id=key.codec_repo,
+                device=str(codec_device),
+                dtype=codec_dtype,
+                deterministic_encode=bool(key.codec_deterministic_encode),
+                deterministic_decode=bool(key.codec_deterministic_decode),
+                enable_watermark=bool(key.enable_watermark),
             )
+            if model_cfg.latent_dim != codec.latent_dim:
+                raise ValueError(
+                    f"Latent dimension mismatch: checkpoint latent_dim={model_cfg.latent_dim} but codec latent_dim={codec.latent_dim}. "
+                    "Use a compatible codec/checkpoint pair."
+                )
 
         return cls(
             key=key,
@@ -508,13 +531,50 @@ class InferenceRuntime:
             tokenizer=tokenizer,
             caption_tokenizer=caption_tokenizer,
             codec=codec,
+            codec_dtype=codec_dtype,
             default_text_max_len=default_text_max_len,
             default_caption_max_len=default_caption_max_len,
         )
 
+    def _load_codec(self) -> DACVAECodec:
+        codec = DACVAECodec.load(
+            repo_id=self.key.codec_repo,
+            device=str(self.codec_device),
+            dtype=self.codec_dtype,
+            deterministic_encode=bool(self.key.codec_deterministic_encode),
+            deterministic_decode=bool(self.key.codec_deterministic_decode),
+            enable_watermark=bool(self.key.enable_watermark),
+        )
+        if self.model_cfg.latent_dim != codec.latent_dim:
+            raise ValueError(
+                f"Latent dimension mismatch: checkpoint latent_dim={self.model_cfg.latent_dim} but codec latent_dim={codec.latent_dim}. "
+                "Use a compatible codec/checkpoint pair."
+            )
+        return codec
+
+    def _get_codec(self) -> DACVAECodec:
+        if self.codec is not None:
+            return self.codec
+        with self._codec_lock:
+            if self.codec is None:
+                self.codec = self._load_codec()
+        return self.codec
+
+    def _drop_codec(self) -> None:
+        codec = self.codec
+        if codec is None:
+            return
+        self.codec = None
+        if hasattr(codec, "model"):
+            del codec.model
+        del codec
+        gc.collect()
+        _empty_device_cache(self.codec_device)
+
     def _load_reference_latent(
         self,
         *,
+        codec: DACVAECodec,
         req: SamplingRequest,
         batch_size: int,
         messages: list[str],
@@ -551,8 +611,8 @@ class InferenceRuntime:
                 1,
                 math.ceil(
                     float(req.max_ref_seconds)
-                    * float(self.codec.sample_rate)
-                    / float(int(self.codec.model.hop_length))
+                    * float(codec.sample_rate)
+                    / float(int(codec.model.hop_length))
                 ),
             )
 
@@ -578,7 +638,7 @@ class InferenceRuntime:
                 )
             elif req.ref_ensure_max:
                 messages.append("info: reference peak safety scaling enabled (ensure_max=True).")
-            ref_latent = self.codec.encode_waveform(
+            ref_latent = codec.encode_waveform(
                 wav.unsqueeze(0),
                 sample_rate=int(sr),
                 normalize_db=req.ref_normalize_db,
@@ -627,7 +687,7 @@ class InferenceRuntime:
                 self.key.model_precision,
                 self.key.codec_device,
                 self.key.codec_precision,
-                self.codec.enable_watermark,
+                bool(self.key.enable_watermark),
                 req.cfg_guidance_mode,
                 req.seconds,
                 req.num_steps,
@@ -738,151 +798,155 @@ class InferenceRuntime:
             _log(f"[runtime] using seed: {used_seed}")
         post_load_t0 = _measure_start(self.model_device, self.codec_device)
 
-        with self._infer_lock, torch.inference_mode():
-            t0 = _measure_start(self.model_device)
-            text_ids, text_mask = self.tokenizer.batch_encode(
-                [normalized_text] * num_candidates,
-                max_length=text_max_len,
-            )
-            stage_sec = _measure_end(self.model_device, t0)
-            stage_timings.append(("tokenize_text", stage_sec))
-            _log(f"[runtime] tokenize_text: {stage_sec * 1000.0:.1f} ms")
-            text_ids = text_ids.to(self.model_device)
-            text_mask = text_mask.to(self.model_device)
-            caption_ids = None
-            caption_mask = None
-            if self.model_cfg.use_caption_condition:
-                if self.caption_tokenizer is None:
-                    raise RuntimeError(
-                        "Caption conditioning is enabled but caption tokenizer is not loaded."
-                    )
-                caption_text = "" if req.caption is None else str(req.caption).strip()
-                caption_ids, caption_mask = self.caption_tokenizer.batch_encode(
-                    [caption_text] * num_candidates,
-                    max_length=caption_max_len,
+        try:
+            with self._infer_lock, torch.inference_mode():
+                codec = self._get_codec()
+                sample_rate = int(codec.sample_rate)
+
+                t0 = _measure_start(self.model_device)
+                text_ids, text_mask = self.tokenizer.batch_encode(
+                    [normalized_text] * num_candidates,
+                    max_length=text_max_len,
                 )
-                if caption_text == "":
-                    caption_mask.zero_()
-                caption_ids = caption_ids.to(self.model_device)
-                caption_mask = caption_mask.to(self.model_device)
-
-            target_samples = int(float(req.seconds) * self.codec.sample_rate)
-            latent_steps = math.ceil(target_samples / int(self.codec.model.hop_length))
-            patched_steps = math.ceil(latent_steps / self.model_cfg.latent_patch_size)
-
-            if isinstance(self.train_cfg, dict):
-                fixed_steps = self.train_cfg.get("fixed_target_latent_steps")
-                if isinstance(fixed_steps, int) and fixed_steps > 0 and latent_steps > fixed_steps:
-                    msg = (
-                        f"warning: requested latent length ({latent_steps}) exceeds fixed_target_latent_steps ({fixed_steps}) "
-                        "used in training. Long-tail stability may degrade."
+                stage_sec = _measure_end(self.model_device, t0)
+                stage_timings.append(("tokenize_text", stage_sec))
+                _log(f"[runtime] tokenize_text: {stage_sec * 1000.0:.1f} ms")
+                text_ids = text_ids.to(self.model_device)
+                text_mask = text_mask.to(self.model_device)
+                caption_ids = None
+                caption_mask = None
+                if self.model_cfg.use_caption_condition:
+                    if self.caption_tokenizer is None:
+                        raise RuntimeError(
+                            "Caption conditioning is enabled but caption tokenizer is not loaded."
+                        )
+                    caption_text = "" if req.caption is None else str(req.caption).strip()
+                    caption_ids, caption_mask = self.caption_tokenizer.batch_encode(
+                        [caption_text] * num_candidates,
+                        max_length=caption_max_len,
                     )
-                    messages.append(msg)
+                    if caption_text == "":
+                        caption_mask.zero_()
+                    caption_ids = caption_ids.to(self.model_device)
+                    caption_mask = caption_mask.to(self.model_device)
+
+                target_samples = int(float(req.seconds) * codec.sample_rate)
+                latent_steps = math.ceil(target_samples / int(codec.model.hop_length))
+                patched_steps = math.ceil(latent_steps / self.model_cfg.latent_patch_size)
+
+                if isinstance(self.train_cfg, dict):
+                    fixed_steps = self.train_cfg.get("fixed_target_latent_steps")
+                    if isinstance(fixed_steps, int) and fixed_steps > 0 and latent_steps > fixed_steps:
+                        msg = (
+                            f"warning: requested latent length ({latent_steps}) exceeds fixed_target_latent_steps ({fixed_steps}) "
+                            "used in training. Long-tail stability may degrade."
+                        )
+                        messages.append(msg)
+                        _log(msg)
+
+                t0 = _measure_start(self.model_device, self.codec_device)
+                msg_count_before_ref = len(messages)
+                ref_latent, ref_mask = self._load_reference_latent(
+                    codec=codec,
+                    req=req,
+                    batch_size=num_candidates,
+                    messages=messages,
+                )
+                stage_sec = _measure_end(self.model_device, t0, self.codec_device)
+                stage_timings.append(("prepare_reference", stage_sec))
+                for msg in messages[msg_count_before_ref:]:
                     _log(msg)
+                _log(f"[runtime] prepare_reference: {stage_sec * 1000.0:.1f} ms")
 
-            t0 = _measure_start(self.model_device, self.codec_device)
-            msg_count_before_ref = len(messages)
-            ref_latent, ref_mask = self._load_reference_latent(
-                req=req,
-                batch_size=num_candidates,
-                messages=messages,
-            )
-            stage_sec = _measure_end(self.model_device, t0, self.codec_device)
-            stage_timings.append(("prepare_reference", stage_sec))
-            for msg in messages[msg_count_before_ref:]:
-                _log(msg)
-            _log(f"[runtime] prepare_reference: {stage_sec * 1000.0:.1f} ms")
+                t0 = _measure_start(self.model_device)
+                z_patched = sample_euler_rf_cfg(
+                    model=self.model,
+                    text_input_ids=text_ids,
+                    text_mask=text_mask,
+                    ref_latent=ref_latent,
+                    ref_mask=ref_mask,
+                    sequence_length=patched_steps,
+                    caption_input_ids=caption_ids,
+                    caption_mask=caption_mask,
+                    num_steps=int(req.num_steps),
+                    cfg_scale_text=cfg_scale_text,
+                    cfg_scale_caption=cfg_scale_caption,
+                    cfg_scale_speaker=cfg_scale_speaker,
+                    cfg_guidance_mode=cfg_mode,
+                    cfg_min_t=float(req.cfg_min_t),
+                    cfg_max_t=float(req.cfg_max_t),
+                    seed=used_seed,
+                    truncation_factor=truncation_factor,
+                    rescale_k=rescale_k,
+                    rescale_sigma=rescale_sigma,
+                    use_context_kv_cache=bool(req.context_kv_cache),
+                    speaker_kv_scale=speaker_kv_scale,
+                    speaker_kv_max_layers=speaker_kv_max_layers,
+                    speaker_kv_min_t=speaker_kv_min_t,
+                )
+                stage_sec = _measure_end(self.model_device, t0)
+                stage_timings.append(("sample_rf", stage_sec))
+                _log(f"[runtime] sample_rf: {stage_sec * 1000.0:.1f} ms")
 
-            t0 = _measure_start(self.model_device)
-            z_patched = sample_euler_rf_cfg(
-                model=self.model,
-                text_input_ids=text_ids,
-                text_mask=text_mask,
-                ref_latent=ref_latent,
-                ref_mask=ref_mask,
-                sequence_length=patched_steps,
-                caption_input_ids=caption_ids,
-                caption_mask=caption_mask,
-                num_steps=int(req.num_steps),
-                cfg_scale_text=cfg_scale_text,
-                cfg_scale_caption=cfg_scale_caption,
-                cfg_scale_speaker=cfg_scale_speaker,
-                cfg_guidance_mode=cfg_mode,
-                cfg_min_t=float(req.cfg_min_t),
-                cfg_max_t=float(req.cfg_max_t),
-                seed=used_seed,
-                truncation_factor=truncation_factor,
-                rescale_k=rescale_k,
-                rescale_sigma=rescale_sigma,
-                use_context_kv_cache=bool(req.context_kv_cache),
-                speaker_kv_scale=speaker_kv_scale,
-                speaker_kv_max_layers=speaker_kv_max_layers,
-                speaker_kv_min_t=speaker_kv_min_t,
-            )
-            stage_sec = _measure_end(self.model_device, t0)
-            stage_timings.append(("sample_rf", stage_sec))
-            _log(f"[runtime] sample_rf: {stage_sec * 1000.0:.1f} ms")
+                t0 = _measure_start(self.model_device)
+                z = unpatchify_latent(
+                    z_patched,
+                    patch_size=self.model_cfg.latent_patch_size,
+                    latent_dim=self.model_cfg.latent_dim,
+                )
+                stage_sec = _measure_end(self.model_device, t0)
+                stage_timings.append(("unpatchify_latent", stage_sec))
+                _log(f"[runtime] unpatchify_latent: {stage_sec * 1000.0:.1f} ms")
+                z = z[:, :latent_steps]
 
-            t0 = _measure_start(self.model_device)
-            z = unpatchify_latent(
-                z_patched,
-                patch_size=self.model_cfg.latent_patch_size,
-                latent_dim=self.model_cfg.latent_dim,
-            )
-            stage_sec = _measure_end(self.model_device, t0)
-            stage_timings.append(("unpatchify_latent", stage_sec))
-            _log(f"[runtime] unpatchify_latent: {stage_sec * 1000.0:.1f} ms")
-            z = z[:, :latent_steps]
+                t0 = _measure_start(self.model_device, self.codec_device)
+                trimmed_audios: list[torch.Tensor] = []
+                if decode_mode == "batch":
+                    audio_batch = codec.decode_latent(z).cpu()
+                    for i in range(num_candidates):
+                        audio_i = audio_batch[i]
+                        max_samples = target_samples
+                        if bool(req.trim_tail):
+                            flattening_point = find_flattening_point(
+                                z[i],
+                                window_size=max(1, int(req.tail_window_size)),
+                                std_threshold=float(req.tail_std_threshold),
+                                mean_threshold=float(req.tail_mean_threshold),
+                            )
+                            flattening_samples = int(flattening_point * int(codec.model.hop_length))
+                            if flattening_samples > 0:
+                                max_samples = min(max_samples, flattening_samples)
+                        trimmed_audios.append(audio_i[:, :max_samples])
+                else:
+                    for i in range(num_candidates):
+                        audio_i = codec.decode_latent(z[i : i + 1]).cpu()[0]
+                        max_samples = target_samples
+                        if bool(req.trim_tail):
+                            flattening_point = find_flattening_point(
+                                z[i],
+                                window_size=max(1, int(req.tail_window_size)),
+                                std_threshold=float(req.tail_std_threshold),
+                                mean_threshold=float(req.tail_mean_threshold),
+                            )
+                            flattening_samples = int(flattening_point * int(codec.model.hop_length))
+                            if flattening_samples > 0:
+                                max_samples = min(max_samples, flattening_samples)
+                        trimmed_audios.append(audio_i[:, :max_samples])
+                stage_sec = _measure_end(self.model_device, t0, self.codec_device)
+                stage_timings.append(("decode_latent", stage_sec))
+                _log(f"[runtime] decode_latent ({decode_mode}): {stage_sec * 1000.0:.1f} ms")
 
-            t0 = _measure_start(self.model_device, self.codec_device)
-            trimmed_audios: list[torch.Tensor] = []
-            if decode_mode == "batch":
-                audio_batch = self.codec.decode_latent(z).cpu()
-                for i in range(num_candidates):
-                    audio_i = audio_batch[i]
-                    max_samples = target_samples
-                    if bool(req.trim_tail):
-                        flattening_point = find_flattening_point(
-                            z[i],
-                            window_size=max(1, int(req.tail_window_size)),
-                            std_threshold=float(req.tail_std_threshold),
-                            mean_threshold=float(req.tail_mean_threshold),
-                        )
-                        flattening_samples = int(
-                            flattening_point * int(self.codec.model.hop_length)
-                        )
-                        if flattening_samples > 0:
-                            max_samples = min(max_samples, flattening_samples)
-                    trimmed_audios.append(audio_i[:, :max_samples])
-            else:
-                for i in range(num_candidates):
-                    audio_i = self.codec.decode_latent(z[i : i + 1]).cpu()[0]
-                    max_samples = target_samples
-                    if bool(req.trim_tail):
-                        flattening_point = find_flattening_point(
-                            z[i],
-                            window_size=max(1, int(req.tail_window_size)),
-                            std_threshold=float(req.tail_std_threshold),
-                            mean_threshold=float(req.tail_mean_threshold),
-                        )
-                        flattening_samples = int(
-                            flattening_point * int(self.codec.model.hop_length)
-                        )
-                        if flattening_samples > 0:
-                            max_samples = min(max_samples, flattening_samples)
-                    trimmed_audios.append(audio_i[:, :max_samples])
-            stage_sec = _measure_end(self.model_device, t0, self.codec_device)
-            stage_timings.append(("decode_latent", stage_sec))
-            _log(f"[runtime] decode_latent ({decode_mode}): {stage_sec * 1000.0:.1f} ms")
-
-            total_to_decode = _measure_end(self.model_device, post_load_t0, self.codec_device)
-            _log(f"[runtime] total_to_decode: {total_to_decode:.3f} s")
+                total_to_decode = _measure_end(self.model_device, post_load_t0, self.codec_device)
+                _log(f"[runtime] total_to_decode: {total_to_decode:.3f} s")
+        finally:
+            if self.key.transient_codec:
+                self._drop_codec()
 
         _log("[runtime] done synthesize")
         return SamplingResult(
             audio=trimmed_audios[0],
             audios=trimmed_audios,
-            sample_rate=int(self.codec.sample_rate),
+            sample_rate=sample_rate,
             stage_timings=stage_timings,
             total_to_decode=total_to_decode,
             used_seed=used_seed,
@@ -892,15 +956,12 @@ class InferenceRuntime:
     def unload(self) -> None:
         del self.model
         del self.tokenizer
-        del self.codec
+        if self.caption_tokenizer is not None:
+            del self.caption_tokenizer
+        self._drop_codec()
         gc.collect()
-        for device in (self.model_device, self.codec_device):
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-            elif device.type == "mps":
-                mps = getattr(torch, "mps", None)
-                if mps is not None and hasattr(mps, "empty_cache"):
-                    mps.empty_cache()
+        _empty_device_cache(self.model_device)
+        _empty_device_cache(self.codec_device)
 
 
 _RUNTIME_CACHE_LOCK = threading.Lock()
