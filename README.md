@@ -86,6 +86,13 @@ For local macOS inference, the current recommended setup is:
 4. `codec_precision=fp16`
 5. `decode_mode=sequential`
 
+For a more memory-oriented Apple Silicon path, the current validated alternative is:
+
+1. `python infer_mlx.py --bootstrap`
+2. `mlx-community/Irodori-TTS-500M-v2-VoiceDesign-8bit`
+3. use the upstream-style MLX sampler defaults first
+4. only lower `sequence_length` after validating that your prompts still finish cleanly
+
 ### Current memory status on Apple Silicon
 
 Measured locally with the `Aratako/Irodori-TTS-500M-v2-VoiceDesign` checkpoint on an 8-second no-reference VoiceDesign request.
@@ -96,12 +103,25 @@ Measured locally with the `Aratako/Irodori-TTS-500M-v2-VoiceDesign` checkpoint o
 | Current cached `fp16` + transient codec path | 2.41 GB | 2.66 GB | N/A | Better steady-state memory with cached runtime |
 | Current low-idle-memory Gradio mode | 2.41 GB | 2.66 GB | 0.23 GB | Returns close to idle after each request |
 
-Practical takeaway:
+### Validated MLX VoiceDesign results on Apple Silicon
 
-- **`fp16` on MPS is the correct default** for this fork.
-- **Keeping the codec transient matters more than moving it to CPU** for this workload.
-- **Unloading the cached runtime after each request is the biggest additional win for idle memory** on Gradio.
-- **This materially improves both steady-state and idle-memory behavior**, but it is still a PyTorch/MPS implementation rather than a full MLX rewrite or quantized deployment.
+Measured locally with `text="今日はいい天気ですね。ゆっくり散歩したくなります。"` and `caption="落ち着いた、近い距離感の女性話者。柔らかく自然に話す。"` using a dedicated `mlx-audio` environment. These numbers are split into **init/load** and **synth** so they line up with the README's load-vs-request framing.
+
+| Path | Status | Init / load | Synth | End-to-end real | Maximum RSS | Peak memory footprint | Output check |
+|---|---|---:|---:|---:|---:|---:|---|
+| MLX VoiceDesign 4bit | Works | 1.16s | 22.26s | 24.01s | 1.33 GB | 3.87 GB | Audible, 4.36s output |
+| MLX VoiceDesign 8bit | Works | 1.13s | 21.14s | 23.06s | 1.50 GB | 4.03 GB | Audible, 4.20s output |
+| MLX VoiceDesign 16bit (`fp16`) | Works | 1.08s | 21.60s | 23.30s | 1.80 GB | 4.35 GB | Audible, 4.20s output |
+| 32bit comparison (`fp32`) | Works | 7.51s | 41.34s | 50.71s | 2.29 GB | N/A | Audible, 4.56s output |
+
+Notes:
+
+- The 32-bit comparison point currently uses **PyTorch/MPS `fp32`**, because no public `mlx-community` 32-bit VoiceDesign repo was available.
+- **`fp16` on MPS is still the correct default** for the PyTorch path in this fork.
+- **MLX 8bit remains the best current balance** in this environment.
+- **MLX 4bit uses the least RSS**, but on the current upstream-aligned path it was still a bit slower than 8bit.
+- **MLX 16bit is close to 8bit in latency, but with higher memory.**
+- **32bit is clearly the slowest and heaviest option.**
 
 ## Quick Start
 
@@ -153,7 +173,17 @@ uv run python gradio_app_voicedesign.py --server-name 0.0.0.0 --server-port 7861
 
 The hosted VoiceDesign demo is available at [Aratako/Irodori-TTS-500M-v2-VoiceDesign-Demo](https://huggingface.co/spaces/Aratako/Irodori-TTS-500M-v2-VoiceDesign-Demo).
 
+For the validated Apple Silicon MLX 8bit VoiceDesign playground, use:
+
+```bash
+uv run python gradio_app_mlx.py --server-name 0.0.0.0 --server-port 7862
+```
+
+The MLX playground includes one-click sample buttons so you can try the validated path immediately without typing prompts first.
+It also autoplays the newest result and keeps a browser-side playback history for quick replay.
+
 `gradio_app.py` is for `Aratako/Irodori-TTS-500M-v2`. `gradio_app_voicedesign.py` is for `Aratako/Irodori-TTS-500M-v2-VoiceDesign`.
+`gradio_app_mlx.py` is the dedicated playground for the validated MLX 8bit VoiceDesign path.
 
 ## Inference
 
@@ -187,6 +217,40 @@ uv run python infer.py \
   --no-ref \
   --output-wav outputs/sample_voice_design.wav
 ```
+
+### Validated MLX VoiceDesign CLI
+
+This repository includes a validated MLX wrapper for the VoiceDesign 8bit path on Apple Silicon.
+
+For an interactive playground, start the dedicated MLX UI:
+
+```bash
+uv run python gradio_app_mlx.py --server-name 127.0.0.1 --server-port 7862
+```
+
+First bootstrap a dedicated local MLX environment:
+
+```bash
+python infer_mlx.py --bootstrap \
+  --text "今日はいい天気ですね。" \
+  --caption "落ち着いた、近い距離感の女性話者" \
+  --output-wav outputs/sample_voice_design_mlx.wav
+```
+
+After the first run, the same command can be reused without `--bootstrap`:
+
+```bash
+python infer_mlx.py \
+  --text "今日はいい天気ですね。" \
+  --caption "落ち着いた、近い距離感の女性話者" \
+  --output-wav outputs/sample_voice_design_mlx.wav
+```
+
+Notes:
+
+- The wrapper uses a dedicated local environment under `.venv-mlx-audio/`.
+- It currently targets the **validated VoiceDesign path** rather than every Irodori inference mode.
+- It rejects output that looks too short or too silent.
 
 ### Inference Parameters
 

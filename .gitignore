@@ -151,6 +151,7 @@ activemq-data/
 .env
 .envrc
 .venv
+.venv-mlx-audio
 env/
 venv/
 ENV/
@@ -217,3 +218,4 @@ __marimo__/
 
 gradio_outputs/
 gradio_outputs_voicedesign/
+gradio_outputs_mlx/
