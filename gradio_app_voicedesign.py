@@ -60,6 +60,10 @@ def _default_precision_for_device(device: str) -> str:
     return default_runtime_precision(device)
 
 
+def _default_keep_runtime_loaded(device: str) -> bool:
+    return str(device).strip().lower() != "mps"
+
+
 def _on_model_device_change(device: str) -> gr.Dropdown:
     choices = _precision_choices_for_device(device)
     return gr.Dropdown(choices=choices, value=_default_precision_for_device(device))
@@ -68,6 +72,10 @@ def _on_model_device_change(device: str) -> gr.Dropdown:
 def _on_codec_device_change(device: str) -> gr.Dropdown:
     choices = _precision_choices_for_device(device)
     return gr.Dropdown(choices=choices, value=_default_precision_for_device(device))
+
+
+def _on_model_device_keep_runtime_change(device: str) -> gr.Checkbox:
+    return gr.Checkbox(value=_default_keep_runtime_loaded(device))
 
 
 def _parse_optional_float(raw: str | None, label: str) -> float | None:
@@ -147,6 +155,7 @@ def _describe_runtime(
     codec_device: str,
     codec_precision: str,
     enable_watermark: bool,
+    keep_runtime_loaded: bool,
 ) -> str:
     runtime_key = _build_runtime_key(
         checkpoint=checkpoint,
@@ -177,6 +186,7 @@ def _describe_runtime(
             f"model_precision: {runtime_key.model_precision}",
             f"codec_device: {runtime_key.codec_device}",
             f"codec_precision: {runtime_key.codec_precision}",
+            f"keep_runtime_loaded: {bool(keep_runtime_loaded)}",
             f"use_caption_condition: {runtime.model_cfg.use_caption_condition}",
             f"use_speaker_condition: {runtime.model_cfg.use_speaker_condition}",
             *notes,
@@ -203,6 +213,7 @@ def _run_generation(
     cfg_min_t: float,
     cfg_max_t: float,
     context_kv_cache: bool,
+    keep_runtime_loaded: bool,
     max_text_len_raw: str,
     max_caption_len_raw: str,
     truncation_factor_raw: str,
@@ -272,69 +283,76 @@ def _run_generation(
         )
     )
 
-    result = runtime.synthesize(
-        SamplingRequest(
-            text=text_value,
-            caption=caption_value or None,
-            ref_wav=None,
-            ref_latent=None,
-            no_ref=True,
-            ref_normalize_db=-16.0,
-            ref_ensure_max=True,
-            num_candidates=requested_candidates,
-            decode_mode="sequential",
-            seconds=FIXED_SECONDS,
-            max_ref_seconds=30.0,
-            max_text_len=max_text_len,
-            max_caption_len=max_caption_len,
-            num_steps=int(num_steps),
-            seed=None if seed is None else int(seed),
-            cfg_guidance_mode=str(cfg_guidance_mode),
-            cfg_scale_text=float(cfg_scale_text),
-            cfg_scale_caption=float(cfg_scale_caption),
-            cfg_scale_speaker=0.0,
-            cfg_scale=cfg_scale,
-            cfg_min_t=float(cfg_min_t),
-            cfg_max_t=float(cfg_max_t),
-            truncation_factor=truncation_factor,
-            rescale_k=rescale_k,
-            rescale_sigma=rescale_sigma,
-            context_kv_cache=bool(context_kv_cache),
-            speaker_kv_scale=None,
-            speaker_kv_min_t=None,
-            speaker_kv_max_layers=None,
-            trim_tail=True,
-        ),
-        log_fn=stdout_log,
-    )
-
-    out_dir = Path("gradio_outputs_voicedesign")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    out_paths: list[str] = []
-    for i, audio in enumerate(result.audios, start=1):
-        out_path = save_wav(
-            out_dir / f"sample_{stamp}_{i:03d}.wav",
-            audio.float(),
-            result.sample_rate,
+    try:
+        result = runtime.synthesize(
+            SamplingRequest(
+                text=text_value,
+                caption=caption_value or None,
+                ref_wav=None,
+                ref_latent=None,
+                no_ref=True,
+                ref_normalize_db=-16.0,
+                ref_ensure_max=True,
+                num_candidates=requested_candidates,
+                decode_mode="sequential",
+                seconds=FIXED_SECONDS,
+                max_ref_seconds=30.0,
+                max_text_len=max_text_len,
+                max_caption_len=max_caption_len,
+                num_steps=int(num_steps),
+                seed=None if seed is None else int(seed),
+                cfg_guidance_mode=str(cfg_guidance_mode),
+                cfg_scale_text=float(cfg_scale_text),
+                cfg_scale_caption=float(cfg_scale_caption),
+                cfg_scale_speaker=0.0,
+                cfg_scale=cfg_scale,
+                cfg_min_t=float(cfg_min_t),
+                cfg_max_t=float(cfg_max_t),
+                truncation_factor=truncation_factor,
+                rescale_k=rescale_k,
+                rescale_sigma=rescale_sigma,
+                context_kv_cache=bool(context_kv_cache),
+                speaker_kv_scale=None,
+                speaker_kv_min_t=None,
+                speaker_kv_max_layers=None,
+                trim_tail=True,
+            ),
+            log_fn=stdout_log,
         )
-        out_paths.append(str(out_path))
 
-    runtime_msg = "runtime: reloaded" if reloaded else "runtime: reused"
-    detail_lines = [
-        runtime_msg,
-        f"seed_used: {result.used_seed}",
-        f"candidates: {len(result.audios)}",
-        *[f"saved[{i}]: {path}" for i, path in enumerate(out_paths, start=1)],
-        *result.messages,
-    ]
-    if runtime.model_cfg.use_speaker_condition:
-        detail_lines.append(
-            "info: speaker conditioning exists in this checkpoint, but this UI forced no-reference mode."
-        )
-    detail_text = "\n".join(detail_lines)
-    timing_text = _format_timings(result.stage_timings, result.total_to_decode)
-    stdout_log(f"[gradio-caption] saved {len(out_paths)} candidates")
+        out_dir = Path("gradio_outputs_voicedesign")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        out_paths: list[str] = []
+        for i, audio in enumerate(result.audios, start=1):
+            out_path = save_wav(
+                out_dir / f"sample_{stamp}_{i:03d}.wav",
+                audio.float(),
+                result.sample_rate,
+            )
+            out_paths.append(str(out_path))
+
+        runtime_msg = "runtime: reloaded" if reloaded else "runtime: reused"
+        detail_lines = [
+            runtime_msg,
+            f"keep_runtime_loaded: {bool(keep_runtime_loaded)}",
+            f"seed_used: {result.used_seed}",
+            f"candidates: {len(result.audios)}",
+            *[f"saved[{i}]: {path}" for i, path in enumerate(out_paths, start=1)],
+            *result.messages,
+        ]
+        if runtime.model_cfg.use_speaker_condition:
+            detail_lines.append(
+                "info: speaker conditioning exists in this checkpoint, but this UI forced no-reference mode."
+            )
+        if not keep_runtime_loaded:
+            detail_lines.append("info: unloaded runtime after request to minimize idle memory.")
+        detail_text = "\n".join(detail_lines)
+        timing_text = _format_timings(result.stage_timings, result.total_to_decode)
+        stdout_log(f"[gradio-caption] saved {len(out_paths)} candidates")
+    finally:
+        if not keep_runtime_loaded:
+            clear_cached_runtime()
 
     audio_updates: list[object] = []
     for i in range(MAX_GRADIO_CANDIDATES):
@@ -359,11 +377,12 @@ def build_ui() -> gr.Blocks:
     codec_precision_choices = _precision_choices_for_device(default_codec_device)
     default_model_precision = _default_precision_for_device(default_model_device)
     default_codec_precision = _default_precision_for_device(default_codec_device)
+    default_keep_runtime_loaded = _default_keep_runtime_loaded(default_model_device)
 
     with gr.Blocks(title="Irodori-TTS VoiceDesign Gradio") as demo:
         gr.Markdown("# Irodori-TTS VoiceDesign Inference")
         gr.Markdown(
-            "VoiceDesign版モデル向けのUIです。caption を入れると caption / style conditioning、空欄なら text-only conditioning で推論します。"
+            "VoiceDesign版モデル向けのUIです。caption を入れると caption / style conditioning、空欄なら text-only conditioning で推論します。macOS/MPS では idle memory を下げるため、既定では各リクエスト後に runtime を解放します。"
         )
 
         with gr.Row():
@@ -448,6 +467,10 @@ def build_ui() -> gr.Blocks:
                 cfg_min_t = gr.Number(label="CFG Min t", value=0.5)
                 cfg_max_t = gr.Number(label="CFG Max t", value=1.0)
                 context_kv_cache = gr.Checkbox(label="Context KV Cache", value=True)
+                keep_runtime_loaded = gr.Checkbox(
+                    label="Keep Runtime Loaded Between Requests",
+                    value=default_keep_runtime_loaded,
+                )
             with gr.Row():
                 max_text_len_raw = gr.Textbox(label="Max Text Len (optional)", value="")
                 max_caption_len_raw = gr.Textbox(label="Max Caption Len (optional)", value="")
@@ -502,6 +525,7 @@ def build_ui() -> gr.Blocks:
                 cfg_min_t,
                 cfg_max_t,
                 context_kv_cache,
+                keep_runtime_loaded,
                 max_text_len_raw,
                 max_caption_len_raw,
                 truncation_factor_raw,
@@ -512,6 +536,11 @@ def build_ui() -> gr.Blocks:
         )
         model_device.change(
             _on_model_device_change, inputs=[model_device], outputs=[model_precision]
+        )
+        model_device.change(
+            _on_model_device_keep_runtime_change,
+            inputs=[model_device],
+            outputs=[keep_runtime_loaded],
         )
         codec_device.change(
             _on_codec_device_change, inputs=[codec_device], outputs=[codec_precision]
@@ -526,6 +555,7 @@ def build_ui() -> gr.Blocks:
                 codec_device,
                 codec_precision,
                 enable_watermark,
+                keep_runtime_loaded,
             ],
             outputs=[clear_cache_msg],
         )

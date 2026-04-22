@@ -73,7 +73,8 @@ The current fork defaults to the following behavior on Apple Silicon:
 
 - **CLI**: if `--model-precision` / `--codec-precision` are omitted, `mps` now auto-selects `fp16`
 - **Gradio**: both UIs default to `mps + fp16`
-- **Cached runtime**: the text-to-latent model stays cached, but the DACVAE codec is loaded only for active requests and released afterward
+- **Transient codec**: the DACVAE codec is loaded only for active requests and released afterward
+- **Low-idle-memory Gradio mode**: on macOS/MPS, both UIs now default to unloading the runtime after each request unless you enable “Keep Runtime Loaded Between Requests”
 
 ### Current Apple Silicon guidance
 
@@ -89,16 +90,18 @@ For local macOS inference, the current recommended setup is:
 
 Measured locally with the `Aratako/Irodori-TTS-500M-v2-VoiceDesign` checkpoint on an 8-second no-reference VoiceDesign request.
 
-| Scenario | `torch.mps.driver_allocated_memory()` after load | after request | Summary |
-|---|---:|---:|---|
-| Legacy cached `fp32` path | 3.60 GB | 4.79 GB | Higher steady-state memory pressure |
-| Current cached `fp16` + transient codec path | 2.41 GB | 2.53 GB | Lower cached-memory pressure while keeping MPS inference |
+| Scenario | `torch.mps.driver_allocated_memory()` after load | after request | after unload | Summary |
+|---|---:|---:|---:|---|
+| Legacy cached `fp32` path | 3.60 GB | 4.79 GB | N/A | Higher steady-state memory pressure |
+| Current cached `fp16` + transient codec path | 2.41 GB | 2.66 GB | N/A | Better steady-state memory with cached runtime |
+| Current low-idle-memory Gradio mode | 2.41 GB | 2.66 GB | 0.23 GB | Returns close to idle after each request |
 
 Practical takeaway:
 
 - **`fp16` on MPS is the correct default** for this fork.
 - **Keeping the codec transient matters more than moving it to CPU** for this workload.
-- **This improves cached-memory behavior materially**, but it is still a PyTorch/MPS implementation rather than a full MLX rewrite or quantized deployment.
+- **Unloading the cached runtime after each request is the biggest additional win for idle memory** on Gradio.
+- **This materially improves both steady-state and idle-memory behavior**, but it is still a PyTorch/MPS implementation rather than a full MLX rewrite or quantized deployment.
 
 ## Quick Start
 
