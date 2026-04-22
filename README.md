@@ -73,6 +73,8 @@ To avoid ambiguity, the benchmark numbers below use these definitions:
 - **synth**: time for one `runtime.synthesize(...)` call after the runtime is already loaded. This is the per-request generation latency.
 - **audio_sec**: generated waveform duration.
 - **rtf_total**: `audio_sec / synth`. Higher is faster.
+- **maximum resident set size (RSS)**: the largest resident memory reported by `/usr/bin/time -l`.
+- **peak memory footprint**: the larger process memory footprint reported by `/usr/bin/time -l`. On Apple Silicon this is the more useful top-line number for comparing MPS runs.
 
 ### Benchmark snapshot on Apple Silicon
 
@@ -110,6 +112,22 @@ This fork should be understood as a **macOS/MPS inference fork**, not a general-
 - If your workload is short and latency is already low, `MPS fp32` may be competitive enough.
 - If your workload is longer or heavier, `MPS fp16` can provide a meaningful speedup.
 - Most importantly, upstream currently cannot run `MPS fp16` at all, while this fork can.
+
+### Memory snapshot on Apple Silicon
+
+Measured with `/usr/bin/time -l` on the same heavier workload class. Memory on Apple Silicon is a little tricky because MPS uses unified memory, so this fork documents both `maximum resident set size` and `peak memory footprint`.
+
+| Condition | maximum RSS | peak memory footprint | Notes |
+|---|---:|---:|---|
+| CPU fp32 | 6.03 GB | 6.30 GB | CPU baseline |
+| MPS fp32 | 2.29 GB | 6.42 GB | MPS shifts memory behavior; RSS alone is misleading |
+| MPS fp16 | 2.29 GB | 5.79 GB | About **9.9% lower** peak footprint than MPS fp32 |
+
+Interpretation:
+
+- For MPS runs, **RSS was almost unchanged** between `fp32` and `fp16`, so RSS alone does not capture the practical difference well.
+- **Peak memory footprint** did improve: `MPS fp16` used about **9.9% less** peak footprint than `MPS fp32` in this measurement.
+- Combined with the latency improvement on heavier workloads, this means the fork is justified by **both** speed and memory behavior, not just by compatibility.
 
 ## Quick Start
 
