@@ -52,6 +52,8 @@ uv sync
 
 **Note**: For Linux/Windows with CUDA, PyTorch is automatically installed from the cu128 index. For macOS (MPS) or CPU-only usage, `uv sync` will install the default PyTorch build.
 
+On this fork, inference also supports `fp16` on `mps`. `bf16` remains CUDA-only.
+
 ## Quick Start
 
 ### Simple Inference
@@ -175,8 +177,8 @@ uv run python infer.py \
 | `--speaker-kv-max-layers` | None | Apply speaker K/V scaling only to first N diffusion layers |
 | `--model-device` | auto | Device for model (`cuda`, `mps`, `cpu`) |
 | `--codec-device` | auto | Device for DACVAE codec |
-| `--model-precision` | `fp32` | Model precision (`fp32`, `bf16`) |
-| `--codec-precision` | `fp32` | Codec precision (`fp32`, `bf16`) |
+| `--model-precision` | `fp32` | Model precision (`fp32`, `bf16`, `fp16`). `bf16` is CUDA-only; `fp16` works on CUDA and MPS. |
+| `--codec-precision` | `fp32` | Codec precision (`fp32`, `bf16`, `fp16`). `bf16` is CUDA-only; `fp16` works on CUDA and MPS. |
 | `--seed` | random | Random seed for reproducibility |
 | `--compile-model` | False | Enable `torch.compile` for faster inference |
 | `--compile-dynamic` | False | Use `dynamic=True` for `torch.compile` |
