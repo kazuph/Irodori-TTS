@@ -428,7 +428,7 @@ def build_ui() -> gr.Blocks:
             "生成後はすぐ再生し、再生済み音声はブラウザ内の履歴に残します。"
         )
 
-        history_state = gr.BrowserState([], storage_key="irodori-tts-mlx-playback-history")
+        history_state = gr.BrowserState([], storage_key="irodori-tts-mlx-playback-history-v2")
 
         with gr.Row(equal_height=True):
             with gr.Column(scale=5):
@@ -512,7 +512,7 @@ def build_ui() -> gr.Blocks:
                         value=True,
                     )
                     cfg_scale_raw = gr.Textbox(label="CFG Scale Override (optional)", value="")
-                ddpm_steps_raw = gr.Textbox(label="Sampler Steps", value="32")
+                ddpm_steps_raw = gr.Textbox(label="Sampler Steps", value="16")
 
             with gr.Column(scale=4):
                 with gr.Group():

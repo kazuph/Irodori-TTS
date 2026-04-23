@@ -49,6 +49,7 @@ def _has_irodori_backend(python_executable: str) -> bool:
     )
     result = subprocess.run(
         [python_executable, "-c", probe],
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         check=False,
@@ -56,20 +57,35 @@ def _has_irodori_backend(python_executable: str) -> bool:
     return result.returncode == 0
 
 
+def _run_bootstrap_command(command: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        check=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+
 def _bootstrap_runner(python_executable: str, runner_python: Path) -> None:
     runner_dir = runner_python.parent.parent
     if not runner_python.exists():
         print(f"[mlx-bootstrap] creating virtualenv at {runner_dir}", flush=True)
-        subprocess.run([python_executable, "-m", "venv", str(runner_dir)], check=True)
+        created = _run_bootstrap_command([python_executable, "-m", "venv", str(runner_dir)])
+        if created.stdout:
+            print(created.stdout, end="", flush=True)
     print("[mlx-bootstrap] installing latest mlx-audio", flush=True)
-    subprocess.run(
-        [str(runner_python), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"],
-        check=True,
+    upgraded = _run_bootstrap_command(
+        [str(runner_python), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"]
     )
-    subprocess.run(
-        [str(runner_python), "-m", "pip", "install", "--upgrade", MLX_AUDIO_GIT],
-        check=True,
+    if upgraded.stdout:
+        print(upgraded.stdout, end="", flush=True)
+    installed = _run_bootstrap_command(
+        [str(runner_python), "-m", "pip", "install", "--upgrade", MLX_AUDIO_GIT]
     )
+    if installed.stdout:
+        print(installed.stdout, end="", flush=True)
     if not _has_irodori_backend(str(runner_python)):
         raise RuntimeError("mlx-audio installation completed, but Irodori-TTS backend is still unavailable.")
 
@@ -255,6 +271,7 @@ def run_mlx_generation(
         cmd,
         check=True,
         env=env,
+        stdin=subprocess.DEVNULL,
         capture_output=capture_output,
         text=True,
     )
