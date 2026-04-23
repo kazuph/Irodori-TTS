@@ -91,7 +91,7 @@ For a more memory-oriented Apple Silicon path, the current validated alternative
 1. `python infer_mlx.py --bootstrap`
 2. `mlx-community/Irodori-TTS-500M-v2-VoiceDesign-8bit`
 3. use the upstream-style MLX sampler defaults first
-4. only lower `sequence_length` after validating that your prompts still finish cleanly
+4. treat **sampler steps** as the main speed knob; do not assume shorter `sequence_length` settings are valid without separate quality validation
 
 ### Current memory status on Apple Silicon
 
@@ -122,6 +122,18 @@ Notes:
 - **MLX 4bit uses the least RSS**, but on the current upstream-aligned path it was still a bit slower than 8bit.
 - **MLX 16bit is close to 8bit in latency, but with higher memory.**
 - **32bit is clearly the slowest and heaviest option.**
+- Profiling on Apple Silicon showed that **latent generation dominates more than model load**, so the main useful speed knob is sampler steps rather than bit-width alone.
+
+Step-only MLX 8bit listening sweep (`3` voice styles x `short/long` prompts):
+
+| Sampler steps | Avg real time | Avg processing time | Listening result |
+|---|---:|---:|---|
+| 40 | 15.59s | 14.16s | Reference |
+| 32 | 13.77s | 12.26s | Safe current default |
+| 24 | 11.97s | 10.59s | All tested prompts finished cleanly; no clear short-text degradation in listening |
+| 16 | 10.38s | 8.91s | All tested prompts finished, but long-form listening showed slightly more mispronunciations than 24 |
+
+In this sweep, **voice style changed mispronunciation behavior more than step count**. The current fork therefore keeps **32 steps as the conservative default**, while **24 steps** is the lowest setting that still looked practical in the latest short/long listening pass.
 
 ## Quick Start
 
@@ -181,6 +193,7 @@ uv run python gradio_app_mlx.py --server-name 0.0.0.0 --server-port 7862
 
 The MLX playground includes one-click sample buttons so you can try the validated path immediately without typing prompts first.
 It also autoplays the newest result and keeps a browser-side playback history for quick replay.
+The playground currently pre-fills **32 sampler steps**. In the latest `3`-voice `x` short/long listening sweep, **24 steps** was the fastest setting that still completed every tested prompt cleanly, while **16 steps** started to show slightly more mispronunciations on long text.
 
 `gradio_app.py` is for `Aratako/Irodori-TTS-500M-v2`. `gradio_app_voicedesign.py` is for `Aratako/Irodori-TTS-500M-v2-VoiceDesign`.
 `gradio_app_mlx.py` is the dedicated playground for the validated MLX 8bit VoiceDesign path.

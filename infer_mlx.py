@@ -176,15 +176,18 @@ def _run_internal(args: argparse.Namespace) -> None:
     print(f"[mlx] model={args.mlx_model}", flush=True)
     print(f"[mlx] output={output_path}", flush=True)
     model = load_tts_model(str(args.mlx_model))
+    generate_kwargs: dict[str, object] = {
+        "text": str(args.text),
+        "caption": str(args.caption),
+        "cfg_guidance_mode": str(args.cfg_guidance_mode),
+        "sequence_length": int(args.sequence_length),
+    }
+    if args.cfg_scale is not None:
+        generate_kwargs["cfg_scale"] = float(args.cfg_scale)
+    if args.ddpm_steps is not None:
+        generate_kwargs["num_steps"] = int(args.ddpm_steps)
     result = next(
-        model.generate(
-            text=str(args.text),
-            caption=str(args.caption),
-            cfg_guidance_mode=str(args.cfg_guidance_mode),
-            sequence_length=int(args.sequence_length),
-            cfg_scale=None if args.cfg_scale is None else float(args.cfg_scale),
-            ddpm_steps=None if args.ddpm_steps is None else int(args.ddpm_steps),
-        )
+        model.generate(**generate_kwargs)
     )
     audio = np.array(result.audio, dtype=np.float32)
     _write_pcm_wav(output_path, audio, sample_rate=int(result.sample_rate))

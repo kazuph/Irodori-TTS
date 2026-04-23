@@ -512,7 +512,7 @@ def build_ui() -> gr.Blocks:
                         value=True,
                     )
                     cfg_scale_raw = gr.Textbox(label="CFG Scale Override (optional)", value="")
-                    ddpm_steps_raw = gr.Textbox(label="DDPM Steps Override (optional)", value="")
+                ddpm_steps_raw = gr.Textbox(label="Sampler Steps", value="32")
 
             with gr.Column(scale=4):
                 with gr.Group():
